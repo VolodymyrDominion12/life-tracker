@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Life Tracker",
+    "slug": "life-tracker",
+    "version": "0.1.0",
+    "scheme": "lifetracker",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "assetBundlePatterns": ["**/*"],
+    "android": {
+      "package": "com.volodymyr.lifetracker",
+      "edgeToEdgeEnabled": true
+    },
+    "ios": {
+      "bundleIdentifier": "com.volodymyr.lifetracker",
+      "supportsTablet": true
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "tsconfigPaths": true
+    }
+  }
+}

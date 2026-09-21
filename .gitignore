@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+dist/
+.bundle-check/
+web-build/
+*.log
+.DS_Store
+expo-env.d.ts
+*.orig.*
