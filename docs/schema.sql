@@ -97,23 +97,30 @@ CREATE INDEX idx_tx_cat     ON transactions(category_id, date) WHERE deleted_at 
 CREATE INDEX idx_tx_loan    ON transactions(loan_id)       WHERE deleted_at IS NULL;
 
 -- ─────────────────────────── кредити ───────────────────────────
+-- rate_value + rate_period — те, як ставку назвав кредитор («0,5% у день»);
+-- annual_rate — вона ж, приведена до річних (банківська конвенція 30/360:
+-- місяць = 30 днів, рік = 360). Порівнювати кредити між собою можна лише
+-- за annual_rate: 2% у місяць і 18% річних — це 24% і 18% річних.
 CREATE TABLE loans (
   id                TEXT PRIMARY KEY,
   name              TEXT NOT NULL,
-  lender            TEXT,
+  lender            TEXT,                       -- джерело кредиту: банк, МФО, магазин
   kind              TEXT CHECK (kind IN ('annuity','differential','revolving','mortgage','installment')),
   principal         INTEGER NOT NULL,           -- початкова сума
   currency          TEXT NOT NULL REFERENCES currencies(code),
-  annual_rate       REAL NOT NULL,              -- % річних на дату start_date
+  annual_rate       REAL NOT NULL,              -- % РІЧНИХ, завжди нормалізовано
+  rate_period       TEXT NOT NULL DEFAULT 'year' CHECK (rate_period IN ('day','month','year')),
+  rate_value        REAL,                       -- ставка як її ввели (за rate_period)
   rate_type         TEXT NOT NULL DEFAULT 'fixed' CHECK (rate_type IN ('fixed','floating')),
   rate_index        TEXT,                       -- напр. 'NBU_rate + 3%' для floating
   term_months       INTEGER,
   start_date        TEXT NOT NULL,
   first_payment_date TEXT,
   payment_day       INTEGER,                    -- день місяця
+  payment_period    TEXT NOT NULL DEFAULT 'month' CHECK (payment_period IN ('day','week','month')),
   payment_amount    INTEGER,                    -- плановий платіж
   early_repayment_fee INTEGER DEFAULT 0,        -- комісія за дострокове погашення
-  closed_at         TEXT,
+  closed_at         TEXT,                       -- нарахування зупиняється цього дня
   note              TEXT,
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
@@ -124,7 +131,9 @@ CREATE TABLE loan_rate_history (
   id             TEXT PRIMARY KEY,
   loan_id        TEXT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
   effective_from TEXT NOT NULL,
-  annual_rate    REAL NOT NULL,
+  annual_rate    REAL NOT NULL,                 -- теж нормалізовано до річних
+  rate_period    TEXT NOT NULL DEFAULT 'year' CHECK (rate_period IN ('day','month','year')),
+  rate_value     REAL,
   note           TEXT,
   created_at     TEXT NOT NULL
 );
@@ -149,7 +158,11 @@ CREATE TABLE loan_payments (
 );
 CREATE INDEX idx_loan_pay ON loan_payments(loan_id, date);
 
--- генерований графік (план), перераховується при зміні ставки/дострокових платежів
+-- Таблиця під збережений графік платежів. Зараз НЕ використовується: план
+-- будується на льоту (`buildAnnuitySchedule`) і не записується, бо він повністю
+-- виводиться з умов кредиту й поточного залишку, а збережена копія неминуче
+-- розійшлася б із розрахунком. Лишена як місце для імпорту чужих графіків
+-- (наприклад, вивантаження з банку) — тоді факт можна буде звіряти з планом.
 CREATE TABLE loan_schedule (
   id             TEXT PRIMARY KEY,
   loan_id        TEXT NOT NULL REFERENCES loans(id) ON DELETE CASCADE,

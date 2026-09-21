@@ -132,3 +132,31 @@ export function earlyRepaymentEffect(params: {
     interestSaved: baseline.totalInterest - withExtra.totalInterest,
   };
 }
+
+/**
+ * За скільки місяців закриється борг, якщо платити фіксовану суму.
+ *
+ * Обернена до ануїтету задача: n = −ln(1 − i·S/P) / ln(1 + i).
+ * Потрібна, коли строк у кредиті не задано, а платіж відомий — тоді без неї
+ * неможливо ані показати «коли закриється», ані порахувати ефект дострокових
+ * внесків.
+ *
+ * `null` означає «ніколи»: платіж не покриває навіть проценти, тож борг
+ * не зменшується. Це не помилка вводу з боку користувача, а реальна
+ * пастка мікропозик, і краще показати її прямо.
+ */
+export function monthsToPayoff(
+  principalMinor: number,
+  annualRatePercent: number,
+  paymentMinor: number,
+): number | null {
+  if (principalMinor <= 0) return 0;
+  if (paymentMinor <= 0) return null;
+
+  const i = monthlyRate(annualRatePercent);
+  if (i === 0) return Math.ceil(principalMinor / paymentMinor);
+  if (paymentMinor <= principalMinor * i) return null;
+
+  const n = -Math.log(1 - (i * principalMinor) / paymentMinor) / Math.log(1 + i);
+  return Math.max(1, Math.ceil(n));
+}

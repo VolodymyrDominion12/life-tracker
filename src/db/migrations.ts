@@ -443,4 +443,33 @@ INSERT OR IGNORE INTO categories (id, name, kind, icon, is_essential, sort_order
   ('cat-other-inc', 'Інший дохід',   'income',  '➕', 0, 999, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 `,
   },
+  {
+    version: 3,
+    name: 'loan_rate_period',
+    sql: `
+-- Ставка кредиту тепер має ПЕРІОД: «0,5% у день», «2% у місяць», «18% річних».
+-- Це не косметика: без періоду два кредити з однаковим числом ставки
+-- («2») могли коштувати у 30 разів по-різному, і сортувати їх не було як.
+--
+-- Розділення на два поля навмисне:
+--   rate_value  + rate_period — те, як ставку назвав кредитор (для показу й редагування);
+--   annual_rate               — та сама ставка, приведена до річних (для порівняння й математики).
+-- Тримати лише одне з них означало б або втратити те, що ввів користувач,
+-- або рахувати проценти від необрізаного до річних числа.
+--
+-- Наявні кредити лишаються з періодом 'year': їхній annual_rate і був річним.
+ALTER TABLE loans ADD COLUMN rate_period TEXT NOT NULL DEFAULT 'year'
+  CHECK (rate_period IN ('day','month','year'));
+ALTER TABLE loans ADD COLUMN rate_value REAL;
+ALTER TABLE loans ADD COLUMN payment_period TEXT NOT NULL DEFAULT 'month'
+  CHECK (payment_period IN ('day','week','month'));
+
+ALTER TABLE loan_rate_history ADD COLUMN rate_period TEXT NOT NULL DEFAULT 'year'
+  CHECK (rate_period IN ('day','month','year'));
+ALTER TABLE loan_rate_history ADD COLUMN rate_value REAL;
+
+UPDATE loans SET rate_value = annual_rate WHERE rate_value IS NULL;
+UPDATE loan_rate_history SET rate_value = annual_rate WHERE rate_value IS NULL;
+`,
+  },
 ];

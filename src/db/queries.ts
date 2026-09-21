@@ -65,10 +65,29 @@ export const WEEKLY_LOAD_LIMIT = `
    ORDER BY week DESC
    LIMIT ?`;
 
+/**
+ * Кредити.
+ *
+ * Нарахування процентів (скільки «набігло») свідомо НЕ рахується тут, у SQL:
+ * воно залежить від дат платежів і змін ставки, а друга реалізація тієї самої
+ * формули в SQL неминуче розійшлася б із тією, що в TypeScript. Тому SQL
+ * віддає факти (Drizzle — типізовані рядки `loans`, `loan_payments`,
+ * `loan_rate_history`), а стан кредиту рахує `domain/loan-accrual.ts`:
+ * одна формула, одне місце, покрите тестами.
+ */
 export const LOAN_BALANCES = `
   SELECT loan_id, loan, currency, principal, balance, principal_paid, interest_paid
     FROM v_loan_balance
    ORDER BY loan`;
+
+/** ?1 = limit. Джерела кредитів, які вже вводили, — щоб не набирати щоразу. */
+export const RECENT_LENDERS = `
+  SELECT lender AS name, COUNT(*) AS n, MAX(created_at) AS last_seen
+    FROM loans
+   WHERE deleted_at IS NULL AND lender IS NOT NULL AND lender <> ''
+   GROUP BY lender
+   ORDER BY last_seen DESC
+   LIMIT ?`;
 
 /**
  * Залишки по рахунках.

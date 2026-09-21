@@ -68,6 +68,12 @@ export const categories = sqliteTable(
 );
 
 // ─────────────────────────── кредити ───────────────────────────
+/**
+ * `annualRate` — завжди річна ставка, навіть якщо користувач вводив денну
+ * чи місячну. Оригінальне значення лежить у `rateValue` + `ratePeriod`.
+ * Так порівняння кредитів між собою (сортування «найдорожчі») і вся
+ * математика йдуть по одному числу, а показати можна те, що ввів користувач.
+ */
 export const loans = sqliteTable('loans', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
@@ -78,12 +84,19 @@ export const loans = sqliteTable('loans', {
   principal: integer('principal').notNull(),
   currency: text('currency').notNull(),
   annualRate: real('annual_rate').notNull(),
+  ratePeriod: text('rate_period', { enum: ['day', 'month', 'year'] })
+    .notNull()
+    .default('year'),
+  rateValue: real('rate_value'),
   rateType: text('rate_type', { enum: ['fixed', 'floating'] }).notNull().default('fixed'),
   rateIndex: text('rate_index'),
   termMonths: integer('term_months'),
   startDate: text('start_date').notNull(),
   firstPaymentDate: text('first_payment_date'),
   paymentDay: integer('payment_day'),
+  paymentPeriod: text('payment_period', { enum: ['day', 'week', 'month'] })
+    .notNull()
+    .default('month'),
   paymentAmount: integer('payment_amount'),
   earlyRepaymentFee: integer('early_repayment_fee').default(0),
   closedAt: text('closed_at'),
@@ -98,6 +111,10 @@ export const loanRateHistory = sqliteTable(
     loanId: text('loan_id').notNull(),
     effectiveFrom: text('effective_from').notNull(),
     annualRate: real('annual_rate').notNull(),
+    ratePeriod: text('rate_period', { enum: ['day', 'month', 'year'] })
+      .notNull()
+      .default('year'),
+    rateValue: real('rate_value'),
     note: text('note'),
     createdAt: text('created_at').notNull(),
   },
@@ -312,7 +329,9 @@ export type Category = typeof categories.$inferSelect;
 export type Transaction = typeof transactions.$inferSelect;
 export type NewTransaction = typeof transactions.$inferInsert;
 export type Loan = typeof loans.$inferSelect;
+export type NewLoan = typeof loans.$inferInsert;
 export type LoanPayment = typeof loanPayments.$inferSelect;
+export type LoanRateHistoryRow = typeof loanRateHistory.$inferSelect;
 export type MealEntry = typeof mealEntries.$inferSelect;
 export type Workout = typeof workouts.$inferSelect;
 export type StudySession = typeof studySessions.$inferSelect;

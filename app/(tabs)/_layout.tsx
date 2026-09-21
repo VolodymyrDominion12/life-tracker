@@ -27,6 +27,10 @@ export default function TabsLayout() {
         options={{ title: 'Сьогодні', tabBarIcon: icon('📅') }}
       />
       <Tabs.Screen
+        name="loans"
+        options={{ title: 'Кредити', tabBarIcon: icon('🏦') }}
+      />
+      <Tabs.Screen
         name="analytics"
         options={{ title: 'Аналітика', tabBarIcon: icon('📈') }}
       />

@@ -45,6 +45,58 @@ export function addDaysISO(iso: string, days: number): string {
   return toISODate(d);
 }
 
+/**
+ * Додає місяці з прив'язкою до календаря, а не до 30 днів.
+ *
+ * Саме тому тут окрема функція: графік платежів «15-го числа» — це місяці,
+ * і 31 січня + 1 місяць має дати 28/29 лютого, а не 3 березня (так поводиться
+ * `setMonth` у JS, тому дата рахується вручну й підрізається під довжину
+ * місяця — інакше платіж «31-го» щомісяця переповзав би на початок наступного).
+ */
+export function addMonthsISO(iso: string, months: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  const total = y! * 12 + (m! - 1) + months;
+  const year = Math.floor(total / 12);
+  const monthIndex = total - year * 12;
+  const lastDay = new Date(year, monthIndex + 1, 0).getDate();
+  const day = Math.min(d!, lastDay);
+  return `${year}-${pad(monthIndex + 1)}-${pad(day)}`;
+}
+
+/** '2026-09-21' → true. Дати в застосунку вводяться руками, тож перевірка потрібна. */
+export function isISODate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const d = new Date(`${value}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return false;
+  // Відсіює те, що JS «пробачає»: 2026-02-31 стає 3 березня.
+  return toISODate(d) === value;
+}
+
+/** Кількість днів від `from` до `to` (додатна, якщо `to` пізніше). */
+export function daysBetweenISO(from: string, to: string): number {
+  const a = new Date(`${from}T12:00:00`);
+  const b = new Date(`${to}T12:00:00`);
+  const days = (b.getTime() - a.getTime()) / 86400000;
+  // Некоректна дата дає NaN, і він розповзається по всьому розрахунку кредиту:
+  // замість «помилка» користувач бачив би «NaN ₴». Краще 0 днів — а хибні дати
+  // відсікає `isISODate` ще на етапі запису.
+  if (!Number.isFinite(days)) return 0;
+  return Math.round(days);
+}
+
+/**
+ * Той самий місяць, але з потрібним числом.
+ *
+ * Число підрізається під довжину місяця: «31-го» у лютому — це 28/29.
+ * Без цього графік платежів у лютому поїхав би на початок березня.
+ */
+export function withDayOfMonth(iso: string, day: number): string {
+  const [y, m] = iso.split('-').map(Number);
+  const lastDay = new Date(y!, m!, 0).getDate();
+  const clamped = Math.min(Math.max(1, Math.round(day)), lastDay);
+  return `${iso.slice(0, 7)}-${pad(clamped)}`;
+}
+
 /** 'YYYY-MM' — ключ місяця, збігається з `substr(date, 1, 7)` у VIEW. */
 export function monthKey(iso: string = todayISO()): string {
   return iso.slice(0, 7);

@@ -36,6 +36,30 @@ export default function RootLayout() {
             headerTintColor: p.text,
           }}
         />
+        {/*
+          Кредити: список живе табом, а форма створення — модальним вікном
+          (щоб «Скасувати» було очевидним), картка кредиту — звичайним екраном
+          з кнопкою «назад» у заголовку.
+        */}
+        <Stack.Screen
+          name="loan/new"
+          options={{
+            presentation: 'modal',
+            headerShown: true,
+            title: 'Новий кредит',
+            headerStyle: { backgroundColor: p.card },
+            headerTintColor: p.text,
+          }}
+        />
+        <Stack.Screen
+          name="loan/[id]"
+          options={{
+            headerShown: true,
+            title: 'Кредит',
+            headerStyle: { backgroundColor: p.card },
+            headerTintColor: p.text,
+          }}
+        />
       </Stack>
     </SafeAreaProvider>
   );

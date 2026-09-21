@@ -25,7 +25,27 @@ import { DatabaseSync } from 'node:sqlite';
 import { CURRENT_SCHEMA_VERSION, runMigrations } from '@/db/migrate';
 import * as Q from '@/db/queries';
 import type { RawDb, SqlParam } from '@/db/raw-db';
-import { annuityPayment, buildAnnuitySchedule, earlyRepaymentEffect } from '@/domain/loan-math';
+import {
+  allocatePayment,
+  annualizeRate,
+  computeLoanState,
+  dailyInterest,
+  formatAnnualRate,
+  formatRate,
+  formatRateValue,
+  monthlyInterest,
+  portfolioSummary,
+  rateForPeriod,
+  rateRisk,
+  sortLoanStates,
+  worstRanking,
+} from '@/domain/loan-accrual';
+import {
+  annuityPayment,
+  buildAnnuitySchedule,
+  earlyRepaymentEffect,
+  monthsToPayoff,
+} from '@/domain/loan-math';
 import {
   buildBackup,
   buildCsv,
@@ -37,7 +57,16 @@ import {
   wipeData,
   type BackupPayload,
 } from '@/features/backup/backup-core';
-import { addDaysISO, humanMinutes, monthEndISO, monthKey } from '@/lib/dates';
+import {
+  addDaysISO,
+  addMonthsISO,
+  daysBetweenISO,
+  humanMinutes,
+  isISODate,
+  monthEndISO,
+  monthKey,
+  withDayOfMonth,
+} from '@/lib/dates';
 import { formatMoney, fromMinor, parseAmountToMinor, toMinor } from '@/lib/money';
 
 // ─────────────────────────── інфраструктура тесту ───────────────────────────
@@ -563,9 +592,315 @@ section('5. Математика кредитів');
   eq('некоректний внесок дає порожній графік, а не нескінченний цикл', broken.rows.length, 0);
 }
 
-// ─────────────────────────── 6. гроші й CSV ───────────────────────────
+// ─────────────────────────── 6. нарахування процентів ───────────────────────────
 
-section('6. Форматування грошей і CSV');
+section('6. Нарахування процентів, періоди ставки й сортування');
+{
+  // ── 6.1 Перерахунок ставки між періодами ──
+  // Конвенція 30/360: 18% річних = 1,5% у місяць = 0,05% у день.
+  eq('ставка 0,5% у день = 180% річних', annualizeRate(0.5, 'day'), 180);
+  eq('ставка 2% у місяць = 24% річних', annualizeRate(2, 'month'), 24);
+  eq('ставка 18% річних лишається 18%', annualizeRate(18, 'year'), 18);
+  eq('18% річних = 1,5% у місяць', rateForPeriod(18, 'month'), 1.5);
+  eq('18% річних = 0,05% у день', rateForPeriod(18, 'day'), 0.05);
+  approx(
+    'перерахунок у день і назад не втрачає ставку',
+    annualizeRate(rateForPeriod(18, 'day'), 'day'),
+    18,
+    1e-9,
+  );
+
+  eq('на 10 000 ₴ під 180% річних набігає 50 ₴ на день', dailyInterest(1000000, 180), 5000);
+  eq('те саме за місяць — 1 500 ₴', monthlyInterest(1000000, 180), 150000);
+
+  eq('підпис ставки без зайвих нулів', formatRateValue(0.5), '0,5%');
+  eq('підпис цілої ставки', formatRateValue(18), '18%');
+  eq('підпис ставки з періодом', formatRate(2, 'month'), '2% / міс');
+  eq('підпис річної ставки', formatAnnualRate(182.5), '182,5% річних');
+
+  eq('20% річних — помірно', rateRisk(20), 'medium');
+  eq('45% річних — дорого', rateRisk(45), 'high');
+  eq('182% річних — критично', rateRisk(182.5), 'critical');
+  eq('5% річних — дешево', rateRisk(5), 'low');
+
+  // ── 6.2 Щоденне нарахування ──
+  const mfo = {
+    id: 'loan-mfo',
+    name: 'Мікропозика',
+    principal: 1000000, // 10 000 ₴
+    annualRate: annualizeRate(0.5, 'day'),
+    startDate: '2026-01-01',
+  };
+
+  const idle = computeLoanState(mfo, [], { asOf: '2026-01-31' });
+  eq('за 30 днів тіло не змінилось', idle.balance, 1000000);
+  eq('за 30 днів під 0,5%/день набігло 1 500 ₴', idle.accruedInterest, 150000);
+  eq('усього до сплати — тіло + набігле', idle.totalOwed, 1150000);
+  eq('на день набігає 50 ₴', idle.dailyInterest, 5000);
+  eq('за місяць набігає 1 500 ₴', idle.monthlyInterest, 150000);
+
+  const paid = computeLoanState(
+    mfo,
+    [{ id: 'p1', date: '2026-01-31', totalAmount: 200000 }],
+    { asOf: '2026-01-31' },
+  );
+  eq('платіж спершу закриває проценти', paid.paidInterest, 150000);
+  eq('залишок платежу зменшує тіло', paid.paidPrincipal, 50000);
+  eq('після платежу тіло — 9 500 ₴', paid.balance, 950000);
+  eq('після платежу набіглого немає', paid.accruedInterest, 0);
+  eq('усього до сплати дорівнює тілу', paid.totalOwed, 950000);
+  eq('усього сплачено — сума платежу', paid.paidTotal, 200000);
+
+  const tenDaysLater = computeLoanState(
+    mfo,
+    [{ id: 'p1', date: '2026-01-31', totalAmount: 200000 }],
+    { asOf: '2026-02-10' },
+  );
+  eq('після платежу проценти набігають на менший залишок', tenDaysLater.accruedInterest, 47500);
+  eq('на день тепер набігає 47,50 ₴', tenDaysLater.dailyInterest, 4750);
+  eq(
+    'усього нараховано за весь час',
+    tenDaysLater.interestAccruedTotal,
+    150000 + 47500,
+  );
+
+  // Платіж, який не покриває навіть проценти: тіло не зменшується взагалі.
+  const partial = computeLoanState(
+    mfo,
+    [{ id: 'p1', date: '2026-01-31', totalAmount: 50000 }],
+    { asOf: '2026-01-31' },
+  );
+  eq('частковий платіж пішов у проценти', partial.paidInterest, 50000);
+  eq('тіло при цьому не зменшилось', partial.balance, 1000000);
+  eq('непокриті проценти лишились як борг', partial.accruedInterest, 100000);
+
+  // Платіж понад борг: зайве не «згорає», а лишається авансом.
+  const overpaid = computeLoanState(
+    mfo,
+    [{ id: 'p1', date: '2026-01-31', totalAmount: 2000000 }],
+    { asOf: '2026-02-10' },
+  );
+  eq('проценти закриті повністю', overpaid.paidInterest, 150000);
+  eq('тіло закрите повністю', overpaid.balance, 0);
+  eq('переплату показано окремо', overpaid.overpaid, 850000);
+  eq('після закриття боргу проценти не набігають', overpaid.accruedInterest, 0);
+
+  // Інша ставка — той самий результат: 1,5% у місяць = 18% річних.
+  const yearly = { ...mfo, annualRate: annualizeRate(18, 'year') };
+  const monthly = { ...mfo, annualRate: annualizeRate(1.5, 'month') };
+  eq(
+    '1,5% у місяць і 18% річних дають однакові проценти',
+    computeLoanState(yearly, [], { asOf: '2026-01-31' }).accruedInterest,
+    computeLoanState(monthly, [], { asOf: '2026-01-31' }).accruedInterest,
+  );
+  eq('18% річних за 30 днів — 150 ₴', computeLoanState(yearly, [], { asOf: '2026-01-31' }).accruedInterest, 15000);
+
+  const free = computeLoanState({ ...mfo, annualRate: 0 }, [], { asOf: '2026-12-31' });
+  eq('безпроцентний кредит не набігає нічого', free.accruedInterest, 0);
+  eq('і тіло не змінюється', free.balance, 1000000);
+
+  // ── 6.3 Зміна ставки ──
+  const withRateChange = computeLoanState(yearly, [], {
+    asOf: '2026-03-03',
+    rateHistory: [
+      { effectiveFrom: '2026-01-01', annualRate: 18 },
+      { effectiveFrom: '2026-02-01', annualRate: 36 },
+    ],
+  });
+  // 30 днів під 18% (1 550 ₴: січень має 31 день) + 30 днів під 36% (3 000 ₴)
+  eq('нарахування розбивається на відрізки ставок', withRateChange.accruedInterest, 15500 + 30000);
+  eq('поточною вважається остання ставка', withRateChange.annualRate, 36);
+
+  // ── 6.4 Закриття кредиту ──
+  const closed = computeLoanState({ ...yearly, closedAt: '2026-01-31' }, [], {
+    asOf: '2026-12-31',
+  });
+  eq('закритий кредит перестає набігати в день закриття', closed.accruedInterest, 15000);
+  eq('стан показано на дату закриття', closed.asOf, '2026-01-31');
+  eq('кредит позначено закритим', closed.isClosed, true);
+
+  const latePayment = computeLoanState(
+    { ...yearly, closedAt: '2026-01-31' },
+    [{ id: 'p-late', date: '2026-03-01', totalAmount: 500000 }],
+    { asOf: '2026-12-31' },
+  );
+  eq('платіж після закриття зменшує борг, а не зникає', latePayment.paidTotal, 500000);
+  eq('але проценти після закриття не набігають', latePayment.interestAccruedTotal, 15000);
+  eq('проценти закрито цим платежем', latePayment.accruedInterest, 0);
+  eq('решта платежу пішла в тіло', latePayment.balance, 1000000 - 485000);
+
+  const futurePayment = computeLoanState(
+    yearly,
+    [{ id: 'p-future', date: '2027-01-01', totalAmount: 500000 }],
+    { asOf: '2026-01-31' },
+  );
+  eq('платіж із майбутньою датою не враховується сьогодні', futurePayment.paidTotal, 0);
+
+  // ── 6.5 Платіж до дати видачі не ламає розрахунок ──
+  const early = computeLoanState(
+    yearly,
+    [{ id: 'p0', date: '2025-12-01', totalAmount: 100000 }],
+    { asOf: '2026-01-31' },
+  );
+  eq('платіж до видачі зменшує тіло з першого дня', early.balance, 900000);
+  check('проценти не стають від’ємними', early.accruedInterest >= 0, `отримано ${early.accruedInterest}`);
+  eq('нарахування йде на зменшене тіло', early.accruedInterest, 13500);
+
+  // ── 6.6 Графік, прострочення й наступний платіж ──
+  const scheduled = {
+    ...yearly,
+    firstPaymentDate: '2026-02-01',
+    paymentPeriod: 'month' as const,
+    paymentAmount: 100000,
+  };
+
+  const overdue = computeLoanState(scheduled, [], { asOf: '2026-04-15' });
+  eq('наступний платіж за графіком', overdue.nextPaymentDate, '2026-05-01');
+  eq('прострочено 14 днів від 1 квітня', overdue.overdueDays, 14);
+
+  const paidOnTime = computeLoanState(
+    scheduled,
+    [{ id: 'p1', date: '2026-04-05', totalAmount: 100000 }],
+    { asOf: '2026-04-15' },
+  );
+  eq('платіж після дати платежу закриває прострочення', paidOnTime.overdueDays, 0);
+  eq('наступний платіж не зсувається', paidOnTime.nextPaymentDate, '2026-05-01');
+
+  const paidEarlier = computeLoanState(
+    scheduled,
+    [{ id: 'p1', date: '2026-03-20', totalAmount: 100000 }],
+    { asOf: '2026-04-15' },
+  );
+  eq('платіж за минулий період не закриває наступний', paidEarlier.overdueDays, 14);
+
+  const noPlan = computeLoanState(yearly, [], { asOf: '2026-04-15' });
+  eq('без графіка прострочення не рахується', noPlan.overdueDays, 0);
+  eq('без графіка наступного платежу немає', noPlan.nextPaymentDate, null);
+
+  const byPaymentDay = computeLoanState(
+    { ...yearly, startDate: '2026-01-15', paymentDay: 31, paymentAmount: 100000 },
+    [],
+    { asOf: '2026-03-05' },
+  );
+  // 31 січня → 28 лютого (підрізано під довжину місяця) → наступний 31 березня
+  eq('день платежу береться з умов', byPaymentDay.overdueDays, 5);
+  eq('лютий підрізає «31-ше» до 28-го', byPaymentDay.nextPaymentDate, '2026-03-31');
+  eq('кінець місяця як число платежу', withDayOfMonth('2026-02-10', 31), '2026-02-28');
+
+  // ── 6.7 Розбиття платежу (та сама функція, що й при збереженні) ──
+  const allocation = allocatePayment(idle, 200000);
+  eq('розбиття: у проценти', allocation.toInterest, 150000);
+  eq('розбиття: у тіло', allocation.toPrincipal, 50000);
+  eq('розбиття: авансу немає', allocation.excess, 0);
+  eq('розбиття понад борг дає аванс', allocatePayment(idle, 2000000).excess, 850000);
+
+  // ── 6.8 Коли кредит закриється ──
+  eq(
+    '100 000 ₴ під 18% платежем 9 168 ₴ закриваються за 12 місяців',
+    monthsToPayoff(10000000, 18, 916800),
+    12,
+  );
+  eq('платіж, менший за проценти, не закриває борг ніколи', monthsToPayoff(10000000, 18, 100000), null);
+  eq('безпроцентний кредит закривається діленням', monthsToPayoff(1200000, 0, 100000), 12);
+  eq('нульовий борг закритий', monthsToPayoff(0, 18, 100000), 0);
+
+  // ── 6.9 Сортування: найгірші — там, де більше процентів ──
+  const sortable = [
+    { id: 'bank', name: 'Банк', annualRate: 18, dailyInterest: 500, totalOwed: 5000000, overdueDays: 0, startDate: '2026-03-01', isClosed: false },
+    { id: 'card', name: 'Картка', annualRate: 48, dailyInterest: 900, totalOwed: 800000, overdueDays: 3, startDate: '2026-05-01', isClosed: false },
+    { id: 'mfo', name: 'МФО', annualRate: 182.5, dailyInterest: 5000, totalOwed: 1150000, overdueDays: 14, startDate: '2026-01-01', isClosed: false },
+    { id: 'paid', name: 'Старий', annualRate: 360, dailyInterest: 0, totalOwed: 0, overdueDays: 0, startDate: '2024-01-01', isClosed: true },
+  ];
+
+  eq(
+    'найдорожчі — першими, закриті — внизу',
+    sortLoanStates(sortable, 'worst').map((r) => r.id).join(','),
+    'mfo,card,bank,paid',
+  );
+  eq(
+    'сортування за ціною дня',
+    sortLoanStates(sortable, 'dailyCost').map((r) => r.id).join(','),
+    'mfo,card,bank,paid',
+  );
+  eq(
+    'сортування за боргом',
+    sortLoanStates(sortable, 'debt').map((r) => r.id).join(','),
+    'bank,mfo,card,paid',
+  );
+  eq(
+    'сортування за простроченням',
+    sortLoanStates(sortable, 'overdue').map((r) => r.id).join(','),
+    'mfo,card,bank,paid',
+  );
+  eq(
+    'сортування за датою видачі',
+    sortLoanStates(sortable, 'newest')[0]?.id,
+    'card',
+  );
+  eq('сортування за назвою', sortLoanStates(sortable, 'name')[0]?.id, 'bank');
+  eq('закритий кредит не очолює список навіть із найвищою ставкою', sortLoanStates(sortable, 'worst')[3]?.id, 'paid');
+
+  const ranks = worstRanking(sortable);
+  eq('найдорожчий кредит отримує номер 1', ranks.mfo, 1);
+  eq('наступний за ціною — номер 2', ranks.card, 2);
+  eq('закритим номери не присвоюються', ranks.paid, undefined);
+
+  const portfolio = portfolioSummary([
+    { balance: 1000000, accruedInterest: 150000, dailyInterest: 5000, annualRate: 180, overdueDays: 14, isClosed: false },
+    { balance: 3000000, accruedInterest: 0, dailyInterest: 1500, annualRate: 18, overdueDays: 0, isClosed: false },
+    { balance: 0, accruedInterest: 0, dailyInterest: 0, annualRate: 360, overdueDays: 0, isClosed: true },
+  ]);
+  eq('борг портфеля — сума залишків', portfolio.debt, 4000000);
+  eq('набігле по портфелю', portfolio.accrued, 150000);
+  eq('ціна дня по портфелю', portfolio.dailyInterest, 6500);
+  eq('активних кредитів — два', portfolio.activeCount, 2);
+  eq('закритих — один', portfolio.closedCount, 1);
+  eq('прострочених — один', portfolio.overdueCount, 1);
+  // Середня ставка зважена на борг: (180×1 000 000 + 18×3 000 000) / 4 000 000
+  approx('середня ставка зважена на борг', portfolio.weightedAnnualRate, 58.5, 1e-9);
+
+  // ── 6.10 Схема: періоди ставки на рівні бази ──
+  const { raw } = freshDb();
+  const columns = raw
+    .getAllSync<{ name: string }>(`PRAGMA table_info(loans)`, [])
+    .map((c) => c.name);
+  for (const expected of ['rate_period', 'rate_value', 'payment_period']) {
+    check(`колонка loans.${expected} створена`, columns.includes(expected));
+  }
+
+  raw.runSync(
+    `INSERT INTO loans (id, name, principal, currency, annual_rate, start_date, created_at, updated_at)
+     VALUES ('loan-def', 'Без періоду', 100000, 'UAH', 18, '2026-01-01', ?, ?)`,
+    [TS, TS],
+  );
+  const defaulted = raw.getFirstSync<{ rate_period: string; payment_period: string; rate_value: number | null }>(
+    `SELECT rate_period, payment_period, rate_value FROM loans WHERE id = 'loan-def'`,
+    [],
+  );
+  eq('ставка без періоду трактується як річна', defaulted?.rate_period, 'year');
+  eq('платежі за замовчуванням — щомісяця', defaulted?.payment_period, 'month');
+
+  let badPeriodRejected = false;
+  try {
+    raw.runSync(
+      `INSERT INTO loans (id, name, principal, currency, annual_rate, rate_period, start_date, created_at, updated_at)
+       VALUES ('loan-bad', 'Кривий період', 100000, 'UAH', 18, 'week', '2026-01-01', ?, ?)`,
+      [TS, TS],
+    );
+  } catch {
+    badPeriodRejected = true;
+  }
+  check('неіснуючий період ставки відхиляється базою', badPeriodRejected);
+
+  const historyColumns = raw
+    .getAllSync<{ name: string }>(`PRAGMA table_info(loan_rate_history)`, [])
+    .map((c) => c.name);
+  check('історія ставок теж знає період', historyColumns.includes('rate_period'));
+}
+
+// ─────────────────────────── 7. гроші й CSV ───────────────────────────
+
+section('7. Форматування грошей і CSV');
 {
   eq('формат суми з розділювачами', formatMoney(123456789), '1 234 567,89 ₴');
   eq('формат від’ємної суми', formatMoney(-5000), '−50,00 ₴');
@@ -609,9 +944,9 @@ section('6. Форматування грошей і CSV');
   check('невідомий експорт кидає помилку', unknownExportThrew);
 }
 
-// ─────────────────────────── 7. бекап і злиття ───────────────────────────
+// ─────────────────────────── 8. бекап і злиття ───────────────────────────
 
-section('7. Бекап, імпорт і LWW-злиття');
+section('8. Бекап, імпорт і LWW-злиття');
 {
   const source = seedFixture();
   const payload = buildBackup(source.raw, '0.1.0');
@@ -621,7 +956,7 @@ section('7. Бекап, імпорт і LWW-злиття');
   eq('бекап містить усі транзакції', payload.tables.transactions?.length, 5);
   check('бекап містить довідники', (payload.tables.categories?.length ?? 0) > 0);
 
-  // 7.1 Імпорт у порожню базу
+  // 8.1 Імпорт у порожню базу
   {
     const target = freshDb();
     const report = importBackup(target.raw, payload);
@@ -659,14 +994,14 @@ section('7. Бекап, імпорт і LWW-злиття');
     eq('після імпорту калорії збігаються з джерелом', targetEnergy?.kcal_in, sourceEnergy?.kcal_in);
     eq('після імпорту хвилини спорту збігаються з джерелом', targetEnergy?.workout_min, sourceEnergy?.workout_min);
 
-    // 7.2 Повторний імпорт того самого файлу нічого не додає
+    // 8.2 Повторний імпорт того самого файлу нічого не додає
     const again = importBackup(target.raw, payload);
     const againStat = again.tables.find((t) => t.table === 'transactions')!;
     eq('повторний імпорт не додає дублікатів', againStat.inserted, 0);
     eq('повторний імпорт не створює нових рядків', dataCounts(target.raw).transactions, 5);
   }
 
-  // 7.3 Локальніший рядок не має бути перетертий старішим із файлу
+  // 8.3 Локальніший рядок не має бути перетертий старішим із файлу
   {
     const target = freshDb();
     importBackup(target.raw, payload);
@@ -714,7 +1049,7 @@ section('7. Бекап, імпорт і LWW-злиття');
     );
   }
 
-  // 7.4 Невідомі колонки ігноруються, а не ламають імпорт
+  // 8.4 Невідомі колонки ігноруються, а не ламають імпорт
   {
     const target = freshDb();
     const withExtra: BackupPayload = {
@@ -733,7 +1068,7 @@ section('7. Бекап, імпорт і LWW-злиття');
     eq('дані при цьому імпортовані', stat.inserted, 2);
   }
 
-  // 7.5 Бекап із новішою версією схеми дає попередження, але не падає
+  // 8.5 Бекап із новішою версією схеми дає попередження, але не падає
   {
     const target = freshDb();
     const report = importBackup(target.raw, { ...payload, schemaVersion: CURRENT_SCHEMA_VERSION + 5 });
@@ -741,7 +1076,7 @@ section('7. Бекап, імпорт і LWW-злиття');
     eq('імпорт усе одно виконано', dataCounts(target.raw).transactions, 5);
   }
 
-  // 7.6 Атомарність: помилка в середині файлу скасовує весь імпорт
+  // 8.6 Атомарність: помилка в середині файлу скасовує весь імпорт
   {
     const target = freshDb();
     const brokenPayload: BackupPayload = {
@@ -799,7 +1134,7 @@ section('7. Бекап, імпорт і LWW-злиття');
     );
   }
 
-  // 7.7 Розбір некоректних файлів
+  // 8.7 Розбір некоректних файлів
   {
     let notJson = false;
     try {
@@ -821,7 +1156,7 @@ section('7. Бекап, імпорт і LWW-злиття');
     eq('коректний бекап розбирається', ok.format, 'life-tracker-backup');
   }
 
-  // 7.8 Очищення даних не зачіпає довідники
+  // 8.8 Очищення даних не зачіпає довідники
   {
     const target = seedFixture();
     wipeData(target.raw);
@@ -842,9 +1177,9 @@ section('7. Бекап, імпорт і LWW-злиття');
   }
 }
 
-// ─────────────────────────── 8. дати ───────────────────────────
+// ─────────────────────────── 9. дати ───────────────────────────
 
-section('8. Робота з датами');
+section('9. Робота з датами');
 {
   eq('кінець місяця для березня', monthEndISO('2026-03-15'), '2026-03-31');
   eq('кінець місяця для лютого (не високосний)', monthEndISO('2026-02-10'), '2026-02-28');
@@ -852,6 +1187,16 @@ section('8. Робота з датами');
   eq('ключ місяця', monthKey('2026-03-15'), '2026-03');
   eq('додавання днів уперед', addDaysISO('2026-03-15', 3), '2026-03-18');
   eq('додавання днів назад через межу місяця', addDaysISO('2026-03-01', -1), '2026-02-28');
+  eq('кількість днів між датами', daysBetweenISO('2026-01-01', '2026-01-31'), 30);
+  eq('кількість днів між датами на межі місяця', daysBetweenISO('2026-01-31', '2026-02-28'), 28);
+  eq('додавання місяців підрізає день під довжину місяця', addMonthsISO('2026-01-31', 1), '2026-02-28');
+  eq('додавання місяців через межу року', addMonthsISO('2026-11-15', 3), '2027-02-15');
+  eq('додавання місяців назад', addMonthsISO('2026-03-31', -1), '2026-02-28');
+  eq('коректна дата розпізнається', isISODate('2026-09-21'), true);
+  eq('дата з неіснуючим днем відхиляється', isISODate('2026-02-31'), false);
+  eq('інший формат дати відхиляється', isISODate('21.09.2026'), false);
+  eq('порожній рядок не є датою', isISODate(''), false);
+  eq('некоректна дата не дає NaN у різниці днів', daysBetweenISO('2026-01-01', ''), 0);
   eq('людяний формат хвилин (години й хвилини)', humanMinutes(125), '2 год 5 хв');
   eq('людяний формат хвилин (тільки хвилини)', humanMinutes(45), '45 хв');
   eq('людяний формат хвилин (рівно година)', humanMinutes(60), '1 год');
