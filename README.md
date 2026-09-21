@@ -198,7 +198,7 @@ RFC 4180, кома як розділювач.
 
 ## Нотатки про середовище цієї машини
 
-Дві проблеми, які я обійшов під час збірки — вони стосуються оточення, а не коду:
+Проблеми, які виникали під час збірки — усі три стосуються оточення, а не коду:
 
 1. **Кеш npm містить файли, що належать root** (наслідок колись запущеного
    `sudo npm`). Через це `npm install` падає з `EACCES`. Я використав локальний кеш
@@ -209,6 +209,44 @@ RFC 4180, кома як розділювач.
 2. **`npx expo start` не запускався тут**, бо Expo CLI пише свій конфіг у `~/.expo`,
    а доступ за межі робочої теки обмежений політикою середовища. Зі свого термінала
    це не проблема — команда створить теку автоматично.
+3. **Metro падає з `ENOSPC: System limit for number of file watchers reached`.**
+   Це не помилка застосунку й не щось, що лікується в коді: ядро Linux обмежує
+   кількість inotify-вотчерів на користувача, а Metro без Watchman вішає окремий
+   вотчер на **кожну теку** проєкту — разом із `node_modules`, де таких тек 5745.
+   На машинах зі старим типовим лімітом `8192` цього не вистачає (у CI-контейнерах
+   із чистим user-namespace ліміт вищий, тому там збірка проходить).
+
+   Перевірити й полікувати (у своєму терміналі, потрібен `sudo`):
+   ```bash
+   # скільки зараз — і хто винен, якщо не Metro
+   cat /proc/sys/fs/inotify/max_user_watches
+   sudo python3 - <<'PY'
+   import glob, collections
+   tot = collections.Counter()
+   for f in glob.glob('/proc/[0-9]*/fdinfo/*'):
+       try: t = open(f).read()
+       except OSError: continue
+       n = t.count('inotify wd:')
+       if n: tot[f.split('/')[2]] += n
+   for pid, n in tot.most_common(5):
+       cmd = open(f'/proc/{pid}/cmdline','rb').read().replace(b'\0', b' ').decode()[:60]
+       print(f'{n:>7}  pid={pid}  {cmd}')
+   print('усього вотчерів:', sum(tot.values()))
+   PY
+
+   # підняти ліміт (вистачає з запасом на будь-який node_modules)
+   sudo sysctl -w fs.inotify.max_user_watches=524288
+   sudo sysctl -w fs.inotify.max_user_instances=1024
+
+   # зробити постійним
+   printf 'fs.inotify.max_user_watches=524288\nfs.inotify.max_user_instances=1024\n' \
+     | sudo tee /etc/sysctl.d/99-inotify.conf
+   sudo sysctl --system
+   ```
+   Альтернатива — `sudo apt install watchman`: Metro тоді використовує один демон
+   замість вотчера на кожну теку (швидше й менше вотчерів), але ліміт усе одно
+   варто підняти. IDE (PyCharm) теж витрачає вотчери на цей проєкт — закривати її
+   не потрібно, якщо ліміт піднято.
 
 Ще одна деталь: у проєкті **TypeScript 7**, де прибрано `baseUrl`, тому шляхи в
 `tsconfig.json` задані відносними (`"@/*": ["./src/*"]`). Якщо колись відкотишся
